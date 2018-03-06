@@ -51,6 +51,9 @@
 #include <string.h>
 #include <ctype.h>
 
+#include "dev/adc-zoul.h"
+#include "dev/zoul-sensors.h"
+
 #define DEBUG DEBUG_NONE
 #include "net/ip/uip-debug.h"
 
@@ -76,14 +79,14 @@ AUTOSTART_PROCESSES(&border_router_process,&webserver_nogui_process);
  * enough program flash is available.
  */
 #define WEBSERVER_CONF_LOADTIME 0
-#define WEBSERVER_CONF_FILESTATS 0
-#define WEBSERVER_CONF_NEIGHBOR_STATUS 0
+#define WEBSERVER_CONF_FILESTATS 1
+#define WEBSERVER_CONF_NEIGHBOR_STATUS 1
 /* Adding links requires a larger RAM buffer. To avoid static allocation
  * the stack can be used for formatting; however tcp retransmissions
  * and multiple connections can result in garbled segments.
  * TODO:use PSOCk_GENERATOR_SEND and tcp state storage to fix this.
  */
-#define WEBSERVER_CONF_ROUTE_LINKS 0
+#define WEBSERVER_CONF_ROUTE_LINKS 1
 #if WEBSERVER_CONF_ROUTE_LINKS
 #define BUF_USES_STACK 1
 #endif
@@ -133,7 +136,8 @@ PROCESS_THREAD(webserver_nogui_process, ev, data)
 
   PROCESS_END();
 }
-AUTOSTART_PROCESSES(&border_router_process,&webserver_nogui_process);
+//Passava Aqui!!
+//AUTOSTART_PROCESSES(&border_router_process,&webserver_nogui_process);
 
 static const char *TOP = "<html><head><title>ContikiRPL</title></head><body>\n";
 static const char *BOTTOM = "</body></html>\n";
@@ -363,6 +367,196 @@ set_prefix_64(uip_ipaddr_t *prefix_64)
   }
 }
 /*---------------------------------------------------------------------------*/
+
+
+/*------------------------------------ Management Begin-----------------------------------------------------------*/
+
+PROCESS(udp_client_process, "UDP client Management process");
+AUTOSTART_PROCESSES(&border_router_process,&webserver_nogui_process,&udp_client_process);
+#define UDP_CLIENT_PORT   8766
+#define UDP_SERVER_PORT   5679
+
+static void
+tcpip_handler(void)
+{
+  char *str;
+
+  if(uip_newdata()) {
+    str = uip_appdata;
+    str[uip_datalen()] = '\0';
+    printf("Received from the server: '%s'\n", str);
+  }
+}
+
+/* Default is to send a packet every 60 seconds */
+#define SEND_INTERVAL		(CLOCK_SECOND)
+/*---------------------------------------------------------------------------*/
+/* The structure used in the Simple UDP library to create an UDP connection */
+static struct uip_udp_conn *client_conn;
+
+/* This is the server IPv6 address */
+static uip_ipaddr_t server_ipaddr;
+
+/* This is a hack to set ourselves the global address, use for testing */
+static void
+set_global_address(void)
+{
+  uip_ipaddr_t ipaddr;
+
+  uip_ip6addr(&ipaddr, 0xaaaa, 0, 0, 0, 0, 0, 0, 0);
+  uip_ds6_set_addr_iid(&ipaddr, &uip_lladdr);
+  uip_ds6_addr_add(&ipaddr, 0, ADDR_AUTOCONF);
+}
+
+
+static void
+stringify_IPv6(uip_ipaddr_t *addr, char *buf)
+{
+
+  char aux1[2] ;
+  char aux2[2] ;
+  char aux3[2] ;
+
+	strcpy(buf, "");
+  strcpy(aux2, "::");
+  strcpy(aux3, ":");
+
+  strcat(buf, "\"");
+  int k;
+  for (k = 0; k < 16; k++) {
+    
+    if(k==2){
+      k= k + 6;
+      strcat(buf, aux2);
+    }else{
+      if(k%2 == 0 && k != 0){
+        strcat(buf, aux3);
+      }
+    }
+    if(k%2 == 0){
+      sprintf(aux1, "%x",addr->u8[k]);
+    }else{
+      sprintf(aux1, "%02x",addr->u8[k]);
+    }
+    strcat(buf, aux1);
+  }
+  strcat(buf, "\"");
+}
+
+static void
+send_packet(void)
+{
+
+	char buf[200];
+
+  strcpy(buf, "{\"nodes\":");
+
+	static uip_ds6_route_t *r;
+  char ip[26];
+  int i =0;
+	for(r = uip_ds6_route_head(); r != NULL; r = uip_ds6_route_next(r)) {
+    uip_ipaddr_t *addr = &r->ipaddr;
+    stringify_IPv6(addr, ip);
+    if(i != 0) {
+      strcat(buf, ", ");
+    }
+    strcat(buf, ip);
+    //Para por a virgula no Json
+    i++;
+  }
+	
+  strcat(buf, "}\n");
+
+  uip_udp_packet_sendto(client_conn, buf, sizeof(buf),
+                        &server_ipaddr, UIP_HTONS(UDP_SERVER_PORT));
+}
+  
+PROCESS_THREAD(udp_client_process, ev, data)
+{
+  static struct etimer periodic;
+
+  PROCESS_BEGIN();
+
+  PROCESS_PAUSE();
+
+
+	printf("UDP Management1: ");
+	
+  /* Remove the comment to set the global address ourselves, as it is it will
+   * obtain the IPv6 prefix from the DODAG root and create its IPv6 global
+   * address
+   */
+  set_global_address();
+
+  printf("UDP client process started\n");
+
+  /* Set the server address here */ 
+  uip_ip6addr(&server_ipaddr, 0xaaaa, 0, 0, 0, 0, 0, 0, 1);
+	printf("UDP Management: ");
+	
+	
+  printf("Server address: ");
+  PRINT6ADDR(&server_ipaddr);
+  printf("\n");
+
+  /* Print the node's addresses */
+  print_local_addresses();
+
+  /* Activate the sensors */
+  adc_zoul.configure(SENSORS_HW_INIT, ZOUL_SENSORS_ADC_ALL);
+
+  SENSORS_ACTIVATE(button_sensor);
+
+  /* Create a new connection with remote host.  When a connection is created
+   * with udp_new(), it gets a local port number assigned automatically.
+   * The "UIP_HTONS()" macro converts to network byte order.
+   * The IP address of the remote host and the pointer to the data are not used
+   * so those are set to NULL
+   */
+  client_conn = udp_new(NULL, UIP_HTONS(UDP_SERVER_PORT), NULL); 
+
+  if(client_conn == NULL) {
+    PRINTF("No UDP connection available, exiting the process!\n");
+    PROCESS_EXIT();
+  }
+
+  /* This function binds a UDP connection to a specified local por */
+  udp_bind(client_conn, UIP_HTONS(UDP_CLIENT_PORT)); 
+
+  PRINTF("Created a connection with the server ");
+  PRINT6ADDR(&client_conn->ripaddr);
+  PRINTF(" local/remote port %u/%u\n", UIP_HTONS(client_conn->lport),
+                                       UIP_HTONS(client_conn->rport));
+
+  etimer_set(&periodic, SEND_INTERVAL);
+
+  while(1) {
+    PROCESS_YIELD();
+
+    /* Incoming events from the TCP/IP module */
+    if(ev == tcpip_event) {
+      tcpip_handler();
+    }
+
+    /* Send data to the server */
+    if((ev == sensors_event && data == &button_sensor) ||
+       (ev == PROCESS_EVENT_TIMER)) {
+
+      send_packet();
+
+      if(etimer_expired(&periodic)) {
+        etimer_reset(&periodic);
+      }
+    }
+  }
+
+  PROCESS_END();
+}
+
+
+/*------------------------------------ Management Begin-----------------------------------------------------------*/
+
+
 PROCESS_THREAD(border_router_process, ev, data)
 {
   static struct etimer et;
